@@ -1,5 +1,72 @@
-on: [push, pull_request, workflow_dispatch]
+name: Build Firmware
+on:
+  push:
+    paths: ['config/**']
+  workflow_dispatch:
 
 jobs:
   build:
-    uses: zmkfirmware/zmk/.github/workflows/build-user-config.yml@main
+    runs-on: ubuntu-latest
+    container: zmkfirmware/zmk-build-arm:stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: West init and update
+        run: |
+          west init -l config
+          west update
+          west zephyr-export 2>/dev/null || true
+
+      - name: Reset ZMK source
+        run: git -C zmk checkout -- . 2>/dev/null || true
+
+      - name: Inject cyboard-rgb module
+        run: |
+          if [ -d cyboard-rgb/src ]; then
+            cp cyboard-rgb/src/cyboard_rgb.c zmk/app/src/
+            cp cyboard-rgb/dts/bindings/zmk,cyboard-rgb.yaml zmk/app/dts/bindings/
+            python3 cyboard-rgb/inject.py zmk/app
+            echo "Cyboard RGB module injected"
+          fi
+
+      - name: Patch keymap for Studio physical layout
+        run: |
+          python3 -c "
+          import re
+          with open('config/imprint.keymap', 'r') as f:
+              content = f.read()
+          m = re.search(r'zmk,matrix-transform\s*=\s*&(\w+)', content)
+          transform = m.group(1) if m else 'imprint_function_row_full_bottom_row'
+          layout_ref = 'physical_layout_' + transform
+          replacement = '\n    chosen { zmk,physical-layout = &' + layout_ref + '; };\n'
+          content = re.sub(r'\s*chosen\s*\{[^}]*\};\s*', replacement, content)
+          with open('config/imprint.keymap', 'w') as f:
+              f.write(content)
+          print(f'Set physical layout to: {layout_ref}')
+          "
+
+      - name: Build left half
+        run: |
+          west build -s zmk/app -b assimilator-bt -S studio-rpc-usb-uart -- \
+            -DSHIELD=imprint_left \
+            -DZMK_CONFIG=$GITHUB_WORKSPACE/config
+
+      - name: Copy left firmware
+        run: cp build/zephyr/zmk.uf2 imprint_left.uf2
+
+      - name: Build right half
+        run: |
+          west build -s zmk/app -b assimilator-bt -p -- \
+            -DSHIELD=imprint_right \
+            -DZMK_CONFIG=$GITHUB_WORKSPACE/config
+
+      - name: Copy right firmware
+        run: cp build/zephyr/zmk.uf2 imprint_right.uf2
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            imprint_left.uf2
+            imprint_right.uf2
